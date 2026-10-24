@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!php.ini
+!apache.conf
+!mpm_prefork.conf
+!wp-config.php

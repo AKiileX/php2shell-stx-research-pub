@@ -1,0 +1,40 @@
+name: php2shell-stx-research-lab
+
+services:
+  db:
+    image: mariadb@sha256:37e2b5002ab032f8611e4ccc424d7009d8bbf8992d511de15af32b0e84deb01c
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress-lab-only
+      MARIADB_ROOT_PASSWORD: root-lab-only
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - db-data:/var/lib/mysql
+
+  wordpress:
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress-lab-only
+    ports:
+      - "127.0.0.1:18940:80"
+    mem_limit: 512m
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  db-data:
