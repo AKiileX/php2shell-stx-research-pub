@@ -15,9 +15,9 @@ The strongest WordPress record used PHP 8.4.26, WordPress 7.1.3,
 128M and 8M PHP limits, and the disabled function list in the README. The PoC
 snapshot SHA-256 was
 `7d7f464dcedf477aa564370279300c289faa00777ea195cfddd401ef8078f905`.
-The public `poc.py` has the same exploit implementation. Its introductory
-description and one Stage 2 failure message were corrected, so its release
-checksum is listed in `SHA256SUMS`.
+The public `poc.py` preserves that exploit implementation and adds the
+validated Apache base-cache path described below. Its current release checksum
+is listed in `SHA256SUMS`.
 
 Three independently fetched `id` receipts used different runtime addresses:
 
@@ -93,3 +93,30 @@ Both receipt files were owned by UID and GID 33. Apache logged the final
 worker exiting on SIGSEGV after the receipt was served. The differing bases
 show fresh runtime address recovery in these two trials. They do not show
 reliable execution on every process lifetime.
+
+## Apache multi-worker base reuse
+
+One successful disclosure was followed by ten Stage 3-only command attempts
+using the same heap and libphp bases. All ten returned unique HTTP receipts.
+The later commands were handled by Apache replacement workers, including log
+PIDs 33, 36, 39, and 48. This showed that the cached bases remained usable
+across worker turnover while the same Apache master remained alive.
+
+The cache implementation was then tested across three additional Apache master
+lifetimes. Each cycle started with an empty cache and an ASLR-changing restart:
+
+| Cycle | Fresh heap base | Fresh libphp base | Fresh command | Cached commands |
+|---|---|---|---|---|
+| 1 | `0x7ce697a00000` | `0x7ce697c90000` | `id` | `whoami`, `pwd` |
+| 2 | `0x7ff3f4000000` | `0x7ff3f4200000` | `id` | `whoami`, `pwd` |
+| 3 | `0x7a51cae00000` | `0x7a51cb14c000` | `id` | `whoami`, `pwd` |
+
+All three fresh disclosures and all six cache-only commands produced
+independent 404-before and 200-after receipts. A separate restart control fed
+the client bases from the previous master. The stale attempt produced no
+receipt, so the client discarded the entry, recovered new bases, and completed
+an independently verified `id` execution.
+
+This does not establish that one cache entry works across multiple backend
+masters or that the first disclosure will succeed in every existing process
+lifetime.

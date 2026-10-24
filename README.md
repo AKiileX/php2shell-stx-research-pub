@@ -52,12 +52,31 @@ This is dynamic runtime address recovery for known profiles. The script does
 not derive function offsets or a working heap layout for an arbitrary unknown
 PHP build. A PHP version header alone cannot establish binary compatibility.
 
+### Apache worker reuse
+
+The Apache profile now keeps a local cache of the disclosed heap and libphp
+bases. Under the tested prefork model, those bases remained valid across the
+original workers and workers later forked by the same Apache master. Ten
+Stage 3-only executions succeeded after one disclosure, including executions
+handled by replacement workers.
+
+The cache is not treated as proof. Every command still needs an independent
+receipt. If Apache restarts and ASLR changes, a cached attempt produces no
+receipt, the entry is discarded, and the client returns to the disclosure
+stages. This restart recovery was tested successfully with different old and
+new heap and module bases.
+
+This result is specific to the exact tested prefork profile. A load balancer
+with multiple backend masters could route requests to different address
+spaces, and first contact with an already-used process lifetime can still miss
+Stage 2.
+
 ## Current PoC
 
 `poc.py` preserves the validated `poc-stx.py` exploit implementation. The
 introductory description and one failure message were corrected for accuracy.
-It uses Python's standard library and accepts `-u`, `-c`, `-verify`, and
-`--profile`.
+It uses Python's standard library and accepts `-u`, `-c`, `-verify`,
+`--profile`, `--base-cache`, and `--no-base-cache`.
 
 - `php84-official-prod-v1` covers the exact Apache/mod_php profile in the
   bundled WordPress lab. The command carrier is calibrated for at most 32
@@ -78,6 +97,10 @@ value of `-c`. Without `-verify`, `-c` supplies the command, with output
 capture depending on the endpoint and carrier size. A missing receipt is
 reported as a failure, even if a worker crashes.
 
+By default, Apache bases are stored under the user's cache directory. Use
+`--no-base-cache` to force a new disclosure attempt, or `--base-cache PATH` to
+keep a separate cache for a particular laboratory run.
+
 ## Reproduce the Apache result
 
 On an amd64 host with Docker Compose and Python 3.10 or newer:
@@ -97,9 +120,11 @@ for this loopback-only fixture. Do not reuse them for a reachable site.
 
 The chain is sensitive to allocation and worker lifetime. A failed attempt
 does not undo the verified runs or prove a target is safe. The client reports
-the stage where it stopped. Verification creates a small receipt file in the
-target's public uploads directory. When finished, remove this disposable lab
-and its database volume with `docker compose -f lab/compose.yaml down -v`.
+the stage where it stopped. After the first successful disclosure, later
+commands against the same Apache master can reuse the cached bases and skip
+Stages 1 and 2. Verification creates a small receipt file in the target's
+public uploads directory. When finished, remove this disposable lab and its
+database volume with `docker compose -f lab/compose.yaml down -v`.
 
 See [EVIDENCE.md](EVIDENCE.md) for the recorded runs and [SHA256SUMS](SHA256SUMS)
 for the PoC snapshot checksum.
@@ -109,6 +134,12 @@ for the PoC snapshot checksum.
 The historical Apache campaign completed 10 of 18 trials across the three
 tested PHP 8 branches. All eight misses were at the module disclosure stage.
 That ratio describes those trials, not a general success rate.
+
+A later PHP 8.4.26 prefork campaign used three fresh Apache master lifetimes.
+All three fresh disclosure runs succeeded, followed by six successful
+cache-only commands. These nine results improve repeated execution after one
+disclosure, but do not establish reliable first contact with every existing
+process lifetime.
 
 A controlled PHP 8.4.26 FPM fixture also reached command execution with fresh
 runtime disclosures. Untouched production-style WordPress behind nginx and
