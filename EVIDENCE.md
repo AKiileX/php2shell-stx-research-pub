@@ -120,3 +120,12 @@ an independently verified `id` execution.
 This does not establish that one cache entry works across multiple backend
 masters or that the first disclosure will succeed in every existing process
 lifetime.
+
+One later disclosure contained two page-aligned module candidates. The real
+`zval_ptr_dtor` value appeared 36 times and a false candidate appeared 5
+times. The earlier client rejected both merely because two candidates existed.
+The selector now accepts a candidate only when it has at least twice the
+support and a margin of at least four repetitions over the runner-up. Close
+results remain an error. Unit controls covered dominant, single, empty, and
+close-candidate cases. A fresh empty-cache run after an ASLR-changing restart
+then recovered new bases and returned an independent `ls` receipt.
